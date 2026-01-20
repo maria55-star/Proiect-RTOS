@@ -74,24 +74,27 @@ void Reset_Handler(){
 }
 
 
-void SysTick_Handler(){
-    
-    static uint32_t last_tick_count = 0;
-    
-    // Măsoară "latency" ca diferență între tick-uri consecutive
-    // (va fi mereu 1 dacă nu sunt întârzieri)
-    if(last_tick_count > 0) {
-        uint32_t current = g_tick;
-        uint32_t latency = current - last_tick_count;
-        
-        isr_latency_cycles = latency;
-        if(latency > max_isr_latency_cycles) {
-            max_isr_latency_cycles = latency;
-        }
+void SysTick_Handler()
+{
+    static uint32_t last_entry = 0;
+
+    uint32_t entry = DWT_CYCCNT;
+
+    if (last_entry != 0) {
+        uint32_t expected = (CPU_CLOCK_HZ / RTOS_TICK_RATE_HZ);
+        uint32_t delta = entry - last_entry;
+
+        uint32_t jitter = (delta > expected) ? (delta - expected) : (expected - delta);
+
+        isr_latency_cycles = jitter;
+        if (jitter > max_isr_latency_cycles) max_isr_latency_cycles = jitter;
     }
-    
-    last_tick_count = g_tick;
+
+    last_entry = entry;
+
     rtos_tick_handler();
+
+    // uint32_t dur = DWT_CYCCNT - entry;
 }
 
 void HardFault_Handler()

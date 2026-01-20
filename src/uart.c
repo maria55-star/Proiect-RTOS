@@ -1,71 +1,72 @@
 #include "uart.h"
+#include <stdint.h>
 
-// USART2 pentru STM32F4 (PA2=TX, PA3=RX)
-#define USART2_BASE   0x40004400
-#define USART2_SR     (*(volatile uint32_t *)(USART2_BASE + 0x00))
-#define USART2_DR     (*(volatile uint32_t *)(USART2_BASE + 0x04))
-#define USART2_BRR    (*(volatile uint32_t *)(USART2_BASE + 0x08))
-#define USART2_CR1    (*(volatile uint32_t *)(USART2_BASE + 0x0C))
-
-#define RCC_APB1ENR   (*(volatile uint32_t *)0x40023840)
 #define RCC_AHB1ENR   (*(volatile uint32_t *)0x40023830)
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40023844)
 
 #define GPIOA_BASE    0x40020000
 #define GPIOA_MODER   (*(volatile uint32_t *)(GPIOA_BASE + 0x00))
-#define GPIOA_AFRL    (*(volatile uint32_t *)(GPIOA_BASE + 0x20))
+#define GPIOA_AFRH    (*(volatile uint32_t *)(GPIOA_BASE + 0x24))
+
+#define USART1_BASE   0x40011000
+#define USART1_SR     (*(volatile uint32_t *)(USART1_BASE + 0x00))
+#define USART1_DR     (*(volatile uint32_t *)(USART1_BASE + 0x04))
+#define USART1_BRR    (*(volatile uint32_t *)(USART1_BASE + 0x08))
+#define USART1_CR1    (*(volatile uint32_t *)(USART1_BASE + 0x0C))
 
 #define USART_SR_TXE  (1 << 7)
-#define USART_CR1_UE  (1 << 13)
-#define USART_CR1_TE  (1 << 3)
 
-void uart_init(void) {
-    RCC_AHB1ENR |= (1 << 0);  
-    RCC_APB1ENR |= (1 << 17); 
+void uart_init(void)
+{
+    // GPIOA clock
+    RCC_AHB1ENR |= (1 << 0);
 
-    GPIOA_MODER &= ~(0x3 << 4);  
-    GPIOA_MODER |= (0x2 << 4);   
-    GPIOA_AFRL &= ~(0xF << 8);
-    GPIOA_AFRL |= (0x7 << 8);    
+    // USART1 clock (APB2, bit 4)
+    RCC_APB2ENR |= (1 << 4);
 
-    // QEMU ignoră adesea valoarea BRR, dar are nevoie de UE și TE activate corect
-    USART2_BRR = 417; 
-    USART2_CR1 = (1 << 13) | (1 << 3) | (1 << 2); // Adaugă și RE (bit 2) pentru stabilitate
+    // PA9 = TX, PA10 = RX -> Alternate Function
+    GPIOA_MODER &= ~((3u << (9*2)) | (3u << (10*2)));
+    GPIOA_MODER |=  ((2u << (9*2)) | (2u << (10*2)));
+
+    // AF7 on PA9/PA10 (AFRH pins 8..15)
+    GPIOA_AFRH &= ~((0xFu << ((9-8)*4)) | (0xFu << ((10-8)*4)));
+    GPIOA_AFRH |=  ((0x7u << ((9-8)*4)) | (0x7u << ((10-8)*4)));
+
+    // Baud (merge și “aprox” în QEMU)
+    USART1_BRR = 417;
+
+    // UE | TE | RE
+    USART1_CR1 = (1 << 13) | (1 << 3) | (1 << 2);
 }
 
-void uart_putc(char c) {
-    // Asteptam pana cand registrul de transmisie e gol
-    while (!(USART2_SR & (1 << 7))); 
-    USART2_DR = c;
+void uart_putc(char c)
+{
+    while (!(USART1_SR & USART_SR_TXE)) {}
+    USART1_DR = (uint32_t)c;
 }
 
-void uart_puts(const char *s) {
+void uart_puts(const char *s)
+{
     while (*s) {
-        // În terminalele Linux/WSL, \n singur nu aduce cursorul la începutul rândului
-        if (*s == '\n') {
-            uart_putc('\r');
-        }
+        if (*s == '\n') uart_putc('\r');
         uart_putc(*s++);
     }
 }
 
-void uart_print_uint(uint32_t val) {
+void uart_print_uint(uint32_t val)
+{
     char buf[12];
     int i = 0;
-    
-    if (val == 0) {
-        uart_putc('0');
-        return;
-    }
-    
+
+    if (val == 0) { uart_putc('0'); return; }
+
     while (val > 0) {
         buf[i++] = '0' + (val % 10);
         val /= 10;
     }
-    
-    while (i > 0) {
-        uart_putc(buf[--i]);
-    }
+    while (i > 0) uart_putc(buf[--i]);
 }
+
 
 void uart_print_hex(uint32_t val) {
     const char hex[] = "0123456789ABCDEF";

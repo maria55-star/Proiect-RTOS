@@ -1,37 +1,11 @@
 #include "rtos.h"
 #include "uart.h"
 
-// ADAUGĂ ASTA:
-#define USART2_SR     (*(volatile uint32_t *)0x40004400)
-#define USART2_DR     (*(volatile uint32_t *)0x40004404)
 
-// GPIO Register Definitions for STM32F1xx
-#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018)
-#define GPIOC_CRL    (*(volatile uint32_t *)0x40011000)
-#define GPIOC_CRH    (*(volatile uint32_t *)0x40011004)
-#define GPIOC_ODR    (*(volatile uint32_t *)0x4001100C)
-#define GPIOC_IDR    (*(volatile uint32_t *)0x40011008)
-
-// RCC APB2ENR bits
-#define RCC_APB2ENR_IOPCEN (1u << 4)
-
-// GPIO Configuration bits
-#define GPIO_CRL_MODE0_SHIFT 0
-#define GPIO_CRL_MODE0_MASK  (3u << GPIO_CRL_MODE0_SHIFT)
-#define GPIO_CRL_CNF0_SHIFT  2
-#define GPIO_CRL_CNF0_MASK   (3u << GPIO_CRL_CNF0_SHIFT)
-
-// GPIO Mode values
-#define GPIO_MODE_INPUT  0x0
-#define GPIO_MODE_OUTPUT_10MHZ 0x1
-#define GPIO_MODE_OUTPUT_2MHZ  0x2
-#define GPIO_MODE_OUTPUT_50MHZ 0x3
-
-// GPIO CNF values for output
-#define GPIO_CNF_OUTPUT_PUSHPULL  0x0
-#define GPIO_CNF_OUTPUT_OPENDRAIN 0x1
-#define GPIO_CNF_OUTPUT_AF_PUSHPULL 0x2
-#define GPIO_CNF_OUTPUT_AF_OPENDRAIN 0x3
+// GPIO Register Definitions for STM32F4xx (GPIOA PA5)
+#define RCC_AHB1ENR   (*(volatile uint32_t *)0x40023830)
+#define GPIOA_MODER   (*(volatile uint32_t *)0x40020000)
+#define GPIOA_ODR     (*(volatile uint32_t *)0x40020014)
 
 extern uint32_t rtos_now();
 
@@ -47,10 +21,13 @@ extern uint32_t rtos_now();
 #define SYST_CSR_TICKINT     (1u << 1)
 #define SYST_CSR_CLKSOURCE   (1u << 2)
 
+
+extern volatile uint32_t g_pi_enabled;
 // ----------------------------------------------
 // Variabile pentru task-uri producer/consumer
 // ----------------------------------------------
 rtos_queue_t q_date;
+rtos_mutex_t demo_mutex;
 volatile uint32_t msj_trimise = 0;
 volatile uint32_t msj_primite = 0;
 volatile uint32_t ultimul_mesaj = 0;
@@ -99,42 +76,47 @@ void systick_init()
 // ----------------------------------------------
 // GPIO Initialization
 // ----------------------------------------------
-void gpio_init(void) {
-    // Enable GPIOC clock
-    RCC_APB2ENR |= RCC_APB2ENR_IOPCEN;
-    
-    // Configure PC13 as push-pull output (LED on many STM32 boards)
-    // Clear MODE13 and CNF13 bits first
-    GPIOC_CRH &= ~((3u << 20) | (3u << 22));
-    // Set MODE13 = 11 (50MHz output) and CNF13 = 00 (push-pull)
-    GPIOC_CRH |= (3u << 20) | (0u << 22);
-    
-    // Initialize LED off (PC13 is active low on many boards)
-    GPIOC_ODR |= (1u << 13);
+static void gpio_init(void)
+{
+    RCC_AHB1ENR |= (1u << 0); // GPIOAEN
+    // PA5 output
+    GPIOA_MODER &= ~(3u << (5*2));
+    GPIOA_MODER |=  (1u << (5*2));
 }
 
 // ----------------------------------------------
 // Task-uri Producer/Consumer
 // ----------------------------------------------
-void task_producator(void) {
+void task_producator(void)
+{
     uint32_t count = 100;
-    while(1) {
+
+    while (1) {
         test_producer_runs++;
-        rtos_delay(1000);
-        rtos_queue_send(&q_date, count);
-        msj_trimise++;
 
-        uart_puts("[PROD] Sent: ");
-        uart_print_uint(count);
-        uart_puts(" @ tick=");
-        uart_print_uint(rtos_now());
-        uart_puts("\n");
+        int rc = rtos_queue_send_timeout(&q_date, count, 10);
 
-        count++;
+        if (rc == 0) {
+            msj_trimise++;
+            uart_puts("[PROD] Sent: ");
+            uart_print_uint(count);
+            uart_puts(" @ tick=");
+            uart_print_uint(rtos_now());
+            uart_puts("\n");
+            count++;
+        } else {
+            uart_puts("[PROD] TIMEOUT send @ tick=");
+            uart_print_uint(rtos_now());
+            uart_puts("\n");
+        }
+
+        rtos_delay(20);
     }
 }
 
+
 void task_consumator(void) {
+    rtos_delay(2000);
     while(1) {
         test_consumer_runs++;
         ultimul_mesaj = rtos_queue_receive(&q_date);
@@ -230,11 +212,10 @@ volatile uint32_t blink_count = 0;
 
 void task_gpio_blink(void) {
     while(1) {
-        // Toggle LED (PC13)
-        GPIOC_ODR ^= (1u << 13);
+        // Toggle LED (PA5)
+        GPIOA_ODR ^= (1u << 5);
         blink_count++;
-        
-        // Print blink status every 10 blinks
+
         if(blink_count % 10 == 0) {
             uart_puts("[BLINK] Count: ");
             uart_print_uint(blink_count);
@@ -242,11 +223,64 @@ void task_gpio_blink(void) {
             uart_print_uint(rtos_now());
             uart_puts("\n");
         }
-        
-        // Delay for 500ms (adjust for desired blink rate)
-        rtos_delay(500);
+
+        // 10 Hz blink: toggle la 50ms => ON+OFF = 100ms
+        rtos_delay(50);
     }
 }
+
+
+// ----------------------------------------------
+// Task-uri pentru Priority Inversion (GPUI/PI demo)
+// ----------------------------------------------
+
+// LOW: ia mutex si il tine mult (CPU work), ca sa existe "owner"
+void task_pi_low_owner(void) {
+    while (1) {
+        rtos_mutex_lock(&demo_mutex);
+
+        uint32_t start = rtos_now();
+        while ((rtos_now() - start) < 200) {   // ~200ms tine mutex
+            __asm volatile("nop");
+        }
+
+        rtos_mutex_unlock(&demo_mutex);
+        rtos_delay(300);
+    }
+}
+
+// MED: "fura" CPU ca sa creeze inversiunea (nu se blocheaza pe mutex)
+void task_pi_medium_hog(void) {
+    rtos_delay(50);
+
+    while (1) {
+        uint32_t start = rtos_now();
+        while ((rtos_now() - start) < 500) {
+            __asm volatile("nop");
+        }
+        rtos_delay(1);
+    }
+}
+
+
+// HIGH: vrea mutex -> asteapta; aici vezi efectul PI/ceiling (GPUI)
+void task_pi_high_waiter(void) {
+    rtos_delay(200);   // IMPORTANT: înainte de while(1)
+
+    while (1) {
+        uint32_t t0 = rtos_now();
+        rtos_mutex_lock(&demo_mutex);
+        uint32_t waited = rtos_now() - t0;
+
+        uart_puts("[PI] HIGH got mutex, waited=");
+        uart_print_uint(waited);
+        uart_puts(" ms\n");
+
+        rtos_mutex_unlock(&demo_mutex);
+        rtos_delay(200);
+    }
+}
+
 
 // ----------------------------------------------
 // Idle Task
@@ -284,6 +318,7 @@ int main(){
     SCB_VTOR = 0x08000000;
 
     uart_init();
+    uart_puts("HELLO UART\n");
     gpio_init();  
 
     /*uart_putc('A'); // Dacă vezi 'A', UART-ul hardware e OK
@@ -302,12 +337,13 @@ int main(){
 
     rtos_init();
     rtos_queue_init(&q_date);
+    rtos_mutex_init(&demo_mutex);
 
     // Initializare si pornire timere
-    rtos_timer_init(&timer_1sec, 1000, timer_1sec_callback);
+    /*rtos_timer_init(&timer_1sec, 1000, timer_1sec_callback);
     rtos_timer_init(&timer_500ms, 500, timer_500ms_callback);
     rtos_timer_start(&timer_1sec);
-    rtos_timer_start(&timer_500ms);
+    rtos_timer_start(&timer_500ms);*/
 
     uart_puts("Creating tasks...\n");
 
@@ -316,12 +352,18 @@ int main(){
     rtos_task_create(task_gpio_blink, 1);     // Prioritate joasă - blink task
     rtos_task_create(task_producator, 2);     // Prioritate medie
     rtos_task_create(task_consumator, 3);     // Prioritate medie-înaltă
-    rtos_task_create(task_rms_t2, 4);         // T2 = 20ms → prioritate mare
-    rtos_task_create(task_rms_t1, 5);         // T1 = 5ms → prioritate maximă
+    //rtos_task_create(task_rms_t2, 4);         // T2 = 20ms → prioritate mare
+    //rtos_task_create(task_rms_t1, 5);         // T1 = 5ms → prioritate maximă
+
+    //rtos_task_create(task_pi_low_owner, 1);
+    //rtos_task_create(task_pi_medium_hog, 3);
+    //rtos_task_create(task_pi_high_waiter, 5);
 
     uart_puts("Starting scheduler...\n");
     uart_puts("=============================\n\n");
 
+    // --- Priority inversion demo tasks (HIGH > MED > LOW)
+   
     rtos_start();
 
     while(1){}
